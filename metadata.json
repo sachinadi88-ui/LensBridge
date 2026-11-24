@@ -1,0 +1,6 @@
+{
+  "name": "LensBridge",
+  "description": "Instant zero-login live video streaming from mobile camera to desktop monitor over the internet via room code or QR pairing.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
