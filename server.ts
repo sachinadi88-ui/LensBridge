@@ -335,7 +335,7 @@ async function startServer(): Promise<void> {
   app.use(express.json({limit: '32kb'}));
 
   app.get('/api/health', (_req, res) => {
-    res.json({ok: true, activeRooms: rooms.size});
+    res.json({ok: true, activeRooms: rooms.size, signaling: 'ws'});
   });
 
   app.get('/api/ice-servers', (_req, res) => {

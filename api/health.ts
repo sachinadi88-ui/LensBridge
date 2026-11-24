@@ -3,6 +3,7 @@ export function GET(): Response {
     JSON.stringify({
       ok: true,
       runtime: 'vercel-serverless',
+      signaling: 'peerjs',
     }),
     {
       status: 200,

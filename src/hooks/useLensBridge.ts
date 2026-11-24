@@ -1,3 +1,4 @@
+import Peer, {type DataConnection, type MediaConnection} from 'peerjs';
 import {useCallback, useEffect, useRef, useState} from 'react';
 import type {
   CameraFacingMode,
@@ -12,7 +13,10 @@ import type {
   VideoQualityPreset,
 } from '../types/stream.ts';
 
-const QUALITY_DIMENSIONS: Record<VideoQualityPreset, {width: number; height: number; fps: number}> = {
+const QUALITY_DIMENSIONS: Record<
+  VideoQualityPreset,
+  {width: number; height: number; fps: number}
+> = {
   '480p': {width: 854, height: 480, fps: 30},
   '720p': {width: 1280, height: 720, fps: 30},
   '1080p': {width: 1920, height: 1080, fps: 30},
@@ -22,6 +26,27 @@ const DEFAULT_ICE_SERVERS: IceServerConfig[] = [
   {urls: 'stun:stun.l.google.com:19302'},
   {urls: 'stun:stun1.l.google.com:19302'},
 ];
+
+const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const PEER_PREFIX = 'lensbridge-v1-';
+
+type SignalingTransport = 'ws' | 'peerjs';
+
+type PeerDataPayload =
+  | {type: 'stream:meta'; meta: StreamMeta}
+  | {type: 'remote:command'; command: RemoteCommand}
+  | {type: 'peer:left'}
+  | {type: 'room:error'; code?: string; message: string};
+
+function generateClientRoomCode(): string {
+  const bytes = new Uint32Array(6);
+  crypto.getRandomValues(bytes);
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += ROOM_ALPHABET[bytes[i] % ROOM_ALPHABET.length];
+  }
+  return code;
+}
 
 export interface UseLensBridgeOptions {
   role: PeerRole;
@@ -54,9 +79,19 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
   const roleRef = useRef<PeerRole>(role);
   roleRef.current = role;
 
+  const transportRef = useRef<SignalingTransport>('ws');
+
+  // WebSocket signaling refs
   const wsRef = useRef<WebSocket | null>(null);
+  const wsEverOpenedRef = useRef<boolean>(false);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const pendingIceRef = useRef<RTCIceCandidateInit[]>([]);
+
+  // PeerJS serverless signaling refs (used automatically on Vercel)
+  const peerRef = useRef<Peer | null>(null);
+  const peerCallRef = useRef<MediaConnection | null>(null);
+  const peerDataConnRef = useRef<DataConnection | null>(null);
+
   const iceServersRef = useRef<IceServerConfig[]>(DEFAULT_ICE_SERVERS);
   const localStreamRef = useRef<MediaStream | null>(null);
   const activeRoomRef = useRef<string>(initialRoomCode ?? '');
@@ -84,13 +119,30 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
   };
 
   const sendSignal = useCallback((msg: ClientSignalMessage) => {
+    if (transportRef.current === 'peerjs') {
+      const conn = peerDataConnRef.current;
+      if (conn && conn.open) {
+        if (msg.type === 'stream:meta') {
+          conn.send({type: 'stream:meta', meta: msg.meta} satisfies PeerDataPayload);
+        } else if (msg.type === 'remote:command') {
+          conn.send({
+            type: 'remote:command',
+            command: msg.command,
+          } satisfies PeerDataPayload);
+        } else if (msg.type === 'leave-room') {
+          conn.send({type: 'peer:left'} satisfies PeerDataPayload);
+        }
+      }
+      return;
+    }
+
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
     }
   }, []);
 
-  const fetchIceServers = useCallback(async () => {
+  const fetchServerConfig = useCallback(async (): Promise<SignalingTransport> => {
     try {
       const res = await fetch('/api/ice-servers');
       if (res.ok) {
@@ -102,6 +154,33 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
     } catch {
       // Fall back to default public STUN
     }
+
+    if (import.meta.env.VITE_SIGNALING_URL?.trim()) {
+      return 'ws';
+    }
+
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3000);
+      const res = await fetch('/api/health', {signal: controller.signal});
+      clearTimeout(timer);
+      if (res.ok) {
+        const data = (await res.json()) as {
+          signaling?: string;
+          runtime?: string;
+        };
+        if (data.signaling === 'ws') {
+          return 'ws';
+        }
+        if (data.signaling === 'peerjs' || data.runtime === 'vercel-serverless') {
+          return 'peerjs';
+        }
+      }
+    } catch {
+      // Static host without /api/health
+    }
+
+    return 'peerjs';
   }, []);
 
   const stopStatsPolling = useCallback(() => {
@@ -113,64 +192,71 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
     setStats(null);
   }, []);
 
-  const startStatsPolling = useCallback((pc: RTCPeerConnection) => {
-    stopStatsPolling();
-    statsTimerRef.current = setInterval(async () => {
-      if (pc.connectionState !== 'connected' && pc.iceConnectionState !== 'connected') {
-        return;
-      }
-      try {
-        const report = await pc.getStats();
-        let width = 0;
-        let height = 0;
-        let fps = 0;
-        let packetsLost = 0;
-        let bitrateKbps = 0;
-        let rttMs: number | null = null;
+  const startStatsPolling = useCallback(
+    (pc: RTCPeerConnection) => {
+      stopStatsPolling();
+      statsTimerRef.current = setInterval(async () => {
+        if (
+          pc.connectionState !== 'connected' &&
+          pc.iceConnectionState !== 'connected'
+        ) {
+          return;
+        }
+        try {
+          const report = await pc.getStats();
+          let width = 0;
+          let height = 0;
+          let fps = 0;
+          let packetsLost = 0;
+          let bitrateKbps = 0;
+          let rttMs: number | null = null;
 
-        report.forEach((stat) => {
-          if (stat.type === 'inbound-rtp' && stat.kind === 'video') {
-            width = stat.frameWidth ?? width;
-            height = stat.frameHeight ?? height;
-            fps = Math.round(stat.framesPerSecond ?? 0);
-            packetsLost = stat.packetsLost ?? 0;
+          report.forEach((stat) => {
+            if (stat.type === 'inbound-rtp' && stat.kind === 'video') {
+              width = stat.frameWidth ?? width;
+              height = stat.frameHeight ?? height;
+              fps = Math.round(stat.framesPerSecond ?? 0);
+              packetsLost = stat.packetsLost ?? 0;
 
-            const bytes = stat.bytesReceived ?? 0;
-            const now = stat.timestamp;
-            if (prevBytesRef.current && now > prevBytesRef.current.timestamp) {
-              const dtSec = (now - prevBytesRef.current.timestamp) / 1000;
-              const deltaBytes = bytes - prevBytesRef.current.bytes;
-              if (dtSec > 0 && deltaBytes >= 0) {
-                bitrateKbps = Math.round((deltaBytes * 8) / dtSec / 1000);
+              const bytes = stat.bytesReceived ?? 0;
+              const now = stat.timestamp;
+              if (prevBytesRef.current && now > prevBytesRef.current.timestamp) {
+                const dtSec = (now - prevBytesRef.current.timestamp) / 1000;
+                const deltaBytes = bytes - prevBytesRef.current.bytes;
+                if (dtSec > 0 && deltaBytes >= 0) {
+                  bitrateKbps = Math.round((deltaBytes * 8) / dtSec / 1000);
+                }
               }
+              prevBytesRef.current = {bytes, timestamp: now};
+            } else if (
+              stat.type === 'candidate-pair' &&
+              stat.state === 'succeeded' &&
+              typeof stat.currentRoundTripTime === 'number'
+            ) {
+              rttMs = Math.round(stat.currentRoundTripTime * 1000);
             }
-            prevBytesRef.current = {bytes, timestamp: now};
-          } else if (
-            stat.type === 'candidate-pair' &&
-            stat.state === 'succeeded' &&
-            typeof stat.currentRoundTripTime === 'number'
-          ) {
-            rttMs = Math.round(stat.currentRoundTripTime * 1000);
-          }
-        });
+          });
 
-        setStats({
-          width,
-          height,
-          fps,
-          bitrateKbps,
-          rttMs,
-          packetsLost,
-        });
-      } catch {
-        // Ignore transient getStats errors during teardown
-      }
-    }, 1000);
-  }, [stopStatsPolling]);
+          setStats({
+            width,
+            height,
+            fps,
+            bitrateKbps,
+            rttMs,
+            packetsLost,
+          });
+        } catch {
+          // Ignore transient getStats errors during teardown
+        }
+      }, 1000);
+    },
+    [stopStatsPolling],
+  );
 
   const closePeerConnection = useCallback(() => {
     stopStatsPolling();
     pendingIceRef.current = [];
+
     if (pcRef.current) {
       pcRef.current.onicecandidate = null;
       pcRef.current.ontrack = null;
@@ -179,11 +265,29 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
       pcRef.current.close();
       pcRef.current = null;
     }
+
+    if (peerCallRef.current) {
+      peerCallRef.current.close();
+      peerCallRef.current = null;
+    }
+    if (peerDataConnRef.current) {
+      peerDataConnRef.current.close();
+      peerDataConnRef.current = null;
+    }
+
     if (roleRef.current === 'viewer') {
       setRemoteStream(null);
       setRemoteMeta(null);
     }
   }, [stopStatsPolling]);
+
+  const destroyPeerJsInstance = useCallback(() => {
+    closePeerConnection();
+    if (peerRef.current) {
+      peerRef.current.destroy();
+      peerRef.current = null;
+    }
+  }, [closePeerConnection]);
 
   const flushPendingIce = useCallback(async (pc: RTCPeerConnection) => {
     const queued = pendingIceRef.current.splice(0);
@@ -233,12 +337,18 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
     };
 
     pc.oniceconnectionstatechange = () => {
-      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      if (
+        pc.iceConnectionState === 'connected' ||
+        pc.iceConnectionState === 'completed'
+      ) {
         setStage('live');
         if (roleRef.current === 'viewer') {
           startStatsPolling(pc);
         }
-      } else if (pc.iceConnectionState === 'failed' && roleRef.current === 'broadcaster') {
+      } else if (
+        pc.iceConnectionState === 'failed' &&
+        roleRef.current === 'broadcaster'
+      ) {
         pc.restartIce();
       }
     };
@@ -356,7 +466,11 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
         stream = await navigator.mediaDevices.getUserMedia({
           video: videoConstraints,
           audio: targetAudio
-            ? {echoCancellation: true, noiseSuppression: true, autoGainControl: true}
+            ? {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+              }
             : false,
         });
       } catch {
@@ -392,9 +506,9 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
       setTorchSupported(hasTorch);
 
       // Seamlessly swap tracks if already streaming to desktop
-      const pc = pcRef.current;
-      if (pc && pc.connectionState !== 'closed') {
-        const senders = pc.getSenders();
+      const activePc = pcRef.current ?? peerCallRef.current?.peerConnection;
+      if (activePc && activePc.connectionState !== 'closed') {
+        const senders = activePc.getSenders();
         const newVideo = stream.getVideoTracks()[0];
         const newAudio = stream.getAudioTracks()[0];
 
@@ -485,6 +599,134 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
   });
   remoteHandlersRef.current = {flipCamera, toggleTorch, toggleMic};
 
+  // --- PeerJS serverless signaling (used automatically on Vercel) ---
+  const initPeerJsViewer = useCallback(
+    (preferredCode?: string) => {
+      destroyPeerJsInstance();
+      setStage('connecting-signaling');
+      setErrorMessage(null);
+
+      const code = preferredCode || generateClientRoomCode();
+      const peer = new Peer(`${PEER_PREFIX}${code}`, {
+        secure: true,
+        config: {
+          iceServers: iceServersRef.current,
+          iceCandidatePoolSize: 4,
+        },
+      });
+      peerRef.current = peer;
+
+      peer.on('open', () => {
+        if (!shouldConnectRef.current || peerRef.current !== peer) return;
+        activeRoomRef.current = code;
+        setRoomCode(code);
+        setSignalingConnected(true);
+        setErrorMessage(null);
+        setStage('waiting-for-peer');
+      });
+
+      peer.on('connection', (conn) => {
+        if (peerDataConnRef.current && peerDataConnRef.current.open) {
+          conn.on('open', () => {
+            conn.send({
+              type: 'room:error',
+              code: 'BROADCASTER_OCCUPIED',
+              message: 'Another mobile camera is already streaming in this room.',
+            } satisfies PeerDataPayload);
+            setTimeout(() => conn.close(), 200);
+          });
+          return;
+        }
+
+        peerDataConnRef.current = conn;
+        conn.on('data', (raw) => {
+          const data = raw as PeerDataPayload;
+          if (!data || typeof data !== 'object') return;
+          if (data.type === 'stream:meta') {
+            setRemoteMeta(data.meta);
+          } else if (data.type === 'peer:left') {
+            closePeerConnection();
+            setStage('waiting-for-peer');
+          }
+        });
+        conn.on('close', () => {
+          if (peerDataConnRef.current === conn) {
+            closePeerConnection();
+            setStage('waiting-for-peer');
+          }
+        });
+      });
+
+      peer.on('call', (call) => {
+        if (peerCallRef.current && peerCallRef.current.open) {
+          call.close();
+          return;
+        }
+
+        peerCallRef.current = call;
+        setStage('negotiating');
+        call.answer();
+
+        call.on('stream', (stream) => {
+          setRemoteStream(stream);
+          setStage('live');
+          setErrorMessage(null);
+          if (call.peerConnection) {
+            startStatsPolling(call.peerConnection);
+          }
+        });
+
+        call.on('close', () => {
+          if (peerCallRef.current === call) {
+            stopStatsPolling();
+            peerCallRef.current = null;
+            setRemoteStream(null);
+            setRemoteMeta(null);
+            setStage('waiting-for-peer');
+          }
+        });
+
+        if (call.peerConnection) {
+          const pc = call.peerConnection;
+          pc.addEventListener('connectionstatechange', () => {
+            if (pc.connectionState === 'disconnected') {
+              setStage('reconnecting');
+            } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+              if (peerCallRef.current === call) {
+                stopStatsPolling();
+                peerCallRef.current = null;
+                setRemoteStream(null);
+                setStage('waiting-for-peer');
+              }
+            } else if (pc.connectionState === 'connected') {
+              setStage('live');
+              startStatsPolling(pc);
+            }
+          });
+        }
+      });
+
+      peer.on('disconnected', () => {
+        setSignalingConnected(false);
+        if (shouldConnectRef.current && !peer.destroyed) {
+          peer.reconnect();
+        }
+      });
+
+      peer.on('error', (err) => {
+        if (err.type === 'unavailable-id') {
+          initPeerJsViewer(generateClientRoomCode());
+          return;
+        }
+        setSignalingConnected(false);
+        setErrorMessage('Signaling connection interrupted. Click New Room to retry.');
+        setStage('error');
+      });
+    },
+    [closePeerConnection, destroyPeerJsInstance, startStatsPolling, stopStatsPolling],
+  );
+
+  // --- WebSocket signaling handlers ---
   const handleServerMessage = useCallback(
     async (msg: ServerSignalMessage) => {
       switch (msg.type) {
@@ -649,15 +891,27 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
   }, []);
 
   const connectSignaling = useCallback(() => {
+    if (transportRef.current === 'peerjs') {
+      if (roleRef.current === 'viewer') {
+        initPeerJsViewer(activeRoomRef.current || undefined);
+      } else {
+        setSignalingConnected(true);
+        setStage('idle');
+      }
+      return;
+    }
+
     if (wsRef.current && wsRef.current.readyState <= WebSocket.OPEN) {
       return;
     }
 
     setStage('connecting-signaling');
+    wsEverOpenedRef.current = false;
     const ws = new WebSocket(resolveSignalingUrl());
     wsRef.current = ws;
 
     ws.onopen = () => {
+      wsEverOpenedRef.current = true;
       setSignalingConnected(true);
       setErrorMessage(null);
 
@@ -700,6 +954,24 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
         clearInterval(heartbeatTimerRef.current);
         heartbeatTimerRef.current = null;
       }
+
+      // If WebSocket never opened and no custom VITE_SIGNALING_URL was set,
+      // automatically switch to PeerJS cloud signaling (e.g., on Vercel static hosts).
+      if (
+        shouldConnectRef.current &&
+        !wsEverOpenedRef.current &&
+        !import.meta.env.VITE_SIGNALING_URL?.trim()
+      ) {
+        transportRef.current = 'peerjs';
+        if (roleRef.current === 'viewer') {
+          initPeerJsViewer(activeRoomRef.current || undefined);
+        } else {
+          setSignalingConnected(true);
+          setStage('idle');
+        }
+        return;
+      }
+
       if (shouldConnectRef.current) {
         setStage((prev) => (prev === 'live' ? 'reconnecting' : prev));
         reconnectTimerRef.current = setTimeout(() => {
@@ -711,7 +983,7 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
     ws.onerror = () => {
       ws.close();
     };
-  }, [handleServerMessage, resolveSignalingUrl, sendSignal]);
+  }, [handleServerMessage, initPeerJsViewer, resolveSignalingUrl, sendSignal]);
 
   const prevRoleRef = useRef<PeerRole>(role);
 
@@ -728,7 +1000,9 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
     }
 
     shouldConnectRef.current = true;
-    void fetchIceServers().then(() => {
+    void fetchServerConfig().then((detectedTransport) => {
+      if (!shouldConnectRef.current) return;
+      transportRef.current = detectedTransport;
       connectSignaling();
     });
 
@@ -752,7 +1026,7 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
       if (heartbeatTimerRef.current) {
         clearInterval(heartbeatTimerRef.current);
       }
-      closePeerConnection();
+      destroyPeerJsInstance();
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
@@ -761,7 +1035,14 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
         stopCamera();
       }
     };
-  }, [role, acquireWakeLock, closePeerConnection, connectSignaling, fetchIceServers, stopCamera]);
+  }, [
+    role,
+    acquireWakeLock,
+    connectSignaling,
+    destroyPeerJsInstance,
+    fetchServerConfig,
+    stopCamera,
+  ]);
 
   const createNewRoom = useCallback(() => {
     if (roleRef.current !== 'viewer') return;
@@ -769,9 +1050,15 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
     peerPresentRef.current = false;
     activeRoomRef.current = '';
     setErrorMessage(null);
+
+    if (transportRef.current === 'peerjs') {
+      initPeerJsViewer();
+      return;
+    }
+
     setStage('connecting-signaling');
     sendSignal({type: 'create-room', role: 'viewer'});
-  }, [closePeerConnection, sendSignal]);
+  }, [closePeerConnection, initPeerJsViewer, sendSignal]);
 
   const joinRoomAsBroadcaster = useCallback(
     async (codeInput: string) => {
@@ -791,6 +1078,114 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
       activeRoomRef.current = cleaned;
       setRoomCode(cleaned);
 
+      if (transportRef.current === 'peerjs') {
+        destroyPeerJsInstance();
+        setStage('connecting-signaling');
+
+        const peer = new Peer({
+          secure: true,
+          config: {
+            iceServers: iceServersRef.current,
+            iceCandidatePoolSize: 4,
+          },
+        });
+        peerRef.current = peer;
+
+        peer.on('open', () => {
+          if (peerRef.current !== peer) return;
+          setSignalingConnected(true);
+          setStage('negotiating');
+
+          const targetPeerId = `${PEER_PREFIX}${cleaned}`;
+          const conn = peer.connect(targetPeerId, {reliable: true});
+          peerDataConnRef.current = conn;
+
+          conn.on('open', () => {
+            conn.send({
+              type: 'stream:meta',
+              meta: metaRef.current,
+            } satisfies PeerDataPayload);
+          });
+
+          conn.on('data', (raw) => {
+            const data = raw as PeerDataPayload;
+            if (!data || typeof data !== 'object') return;
+            if (data.type === 'room:error') {
+              setErrorMessage(data.message);
+              destroyPeerJsInstance();
+              setStage('error');
+            } else if (data.type === 'remote:command') {
+              if (data.command.action === 'flip-camera') {
+                void remoteHandlersRef.current.flipCamera();
+              } else if (data.command.action === 'toggle-torch') {
+                void remoteHandlersRef.current.toggleTorch();
+              } else if (data.command.action === 'toggle-mic') {
+                remoteHandlersRef.current.toggleMic();
+              }
+            }
+          });
+
+          conn.on('close', () => {
+            if (peerDataConnRef.current === conn) {
+              closePeerConnection();
+              peerPresentRef.current = false;
+              setStage('waiting-for-peer');
+              void releaseWakeLock();
+            }
+          });
+
+          const call = peer.call(targetPeerId, stream);
+          if (!call) {
+            setErrorMessage('Unable to start call with desktop viewer.');
+            setStage('error');
+            return;
+          }
+          peerCallRef.current = call;
+          peerPresentRef.current = true;
+          void acquireWakeLock();
+
+          if (call.peerConnection) {
+            const pc = call.peerConnection;
+            pc.addEventListener('connectionstatechange', () => {
+              if (pc.connectionState === 'connected') {
+                setStage('live');
+                setErrorMessage(null);
+              } else if (pc.connectionState === 'disconnected') {
+                setStage('reconnecting');
+              } else if (pc.connectionState === 'failed') {
+                setStage('reconnecting');
+                pc.restartIce();
+              }
+            });
+          }
+
+          call.on('close', () => {
+            if (peerCallRef.current === call) {
+              peerCallRef.current = null;
+              peerPresentRef.current = false;
+              setStage('waiting-for-peer');
+              void releaseWakeLock();
+            }
+          });
+        });
+
+        peer.on('error', (err) => {
+          if (err.type === 'peer-unavailable') {
+            setErrorMessage(
+              'Room not found. Check the code shown on your desktop viewer.',
+            );
+            destroyPeerJsInstance();
+            activeRoomRef.current = '';
+            setStage('error');
+            return;
+          }
+          setErrorMessage('Could not connect to desktop viewer.');
+          setStage('error');
+        });
+
+        return true;
+      }
+
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         setStage('connecting-signaling');
         sendSignal({type: 'join-room', roomCode: cleaned, role: 'broadcaster'});
@@ -799,17 +1194,29 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
       }
       return true;
     },
-    [connectSignaling, sendSignal, startCamera],
+    [
+      acquireWakeLock,
+      closePeerConnection,
+      connectSignaling,
+      destroyPeerJsInstance,
+      releaseWakeLock,
+      sendSignal,
+      startCamera,
+    ],
   );
 
   const stopBroadcast = useCallback(() => {
     sendSignal({type: 'leave-room'});
-    closePeerConnection();
+    if (transportRef.current === 'peerjs') {
+      destroyPeerJsInstance();
+    } else {
+      closePeerConnection();
+    }
     peerPresentRef.current = false;
     activeRoomRef.current = '';
     setStage('idle');
     void releaseWakeLock();
-  }, [closePeerConnection, releaseWakeLock, sendSignal]);
+  }, [closePeerConnection, destroyPeerJsInstance, releaseWakeLock, sendSignal]);
 
   const sendRemoteCommand = useCallback(
     (command: RemoteCommand) => {
