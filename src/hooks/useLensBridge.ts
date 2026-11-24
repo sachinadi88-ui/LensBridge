@@ -627,14 +627,34 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
     ],
   );
 
+  const resolveSignalingUrl = useCallback((): string => {
+    const configured = import.meta.env.VITE_SIGNALING_URL?.trim();
+    if (configured) {
+      try {
+        const parsed = new URL(configured);
+        if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
+        if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
+        if (parsed.protocol === 'ws:' || parsed.protocol === 'wss:') {
+          if (!parsed.pathname || parsed.pathname === '/') {
+            parsed.pathname = '/ws';
+          }
+          return parsed.toString();
+        }
+      } catch {
+        // Fall through to same-origin default
+      }
+    }
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${proto}//${window.location.host}/ws`;
+  }, []);
+
   const connectSignaling = useCallback(() => {
     if (wsRef.current && wsRef.current.readyState <= WebSocket.OPEN) {
       return;
     }
 
     setStage('connecting-signaling');
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+    const ws = new WebSocket(resolveSignalingUrl());
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -691,7 +711,7 @@ export function useLensBridge({role, initialRoomCode}: UseLensBridgeOptions) {
     ws.onerror = () => {
       ws.close();
     };
-  }, [handleServerMessage, sendSignal]);
+  }, [handleServerMessage, resolveSignalingUrl, sendSignal]);
 
   const prevRoleRef = useRef<PeerRole>(role);
 
